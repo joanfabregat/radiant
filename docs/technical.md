@@ -38,21 +38,22 @@ The architecture separates detection, qualification, and report generation into 
                           │            │          - Top-k similar cases       │
                           │            │          - Similarity scores         │
                           │            │          - Suggested labels          │
-                          │            │  Method: RAG (Plan A) or             │
-                          │            │          Classification (Plan B)     │
+                          │            │  Method: RAG → Rerank                │
                           │            └──────────────────────────────────────┘
                           │                         │
                           └────────────┬────────────┘
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  STEP 3: Report Generation                                                  │
-│  ─────────────────────────                                                  │
-│  Input:  - Original X-ray                                                   │
-│          - Bounding boxes from Step 1                                       │
-│          - Qualification results from Step 2 (if any)                       │
+│  STEP 3: Report Generation (two-stage)                                      │
+│  ─────────────────────────────────────                                      │
+│  Stage A: VLM describes each cropped anomaly                                │
+│  Stage B: LLM synthesizes findings into coherent report                     │
+│                                                                             │
+│  Input:  - Cropped anomaly images (NOT full X-ray)                          │
+│          - Qualification results from Step 2                                │
+│          - Location metadata                                                │
 │  Output: Draft report (structured text)                                     │
-│  Model:  LLM or VLM with constrained output schema                          │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -96,6 +97,13 @@ The architecture separates detection, qualification, and report generation into 
 
 If Step 1 detects **no anomalies**, the pipeline skips Step 2 and proceeds directly to Step 3 with an empty finding list. Step 3 generates a report indicating no abnormalities were detected.
 
+### Training datasets for Step 1
+
+| Dataset | Size | Notes |
+|---------|------|-------|
+| RSNA Pneumonia | 30k images | Bounding box annotations — ideal for detection training |
+| VinDr-CXR | 18k images | Detailed local annotations with bounding boxes |
+
 ---
 
 ## Step 2 – Anomaly Qualification
@@ -109,7 +117,18 @@ If Step 1 detects **no anomalies**, the pipeline skips Step 2 and proceeds direc
 | **Input** | Cropped image region for each bounding box from Step 1 |
 | **Output** | For each anomaly: top-k similar cases, similarity scores, suggested label(s) |
 
-### Plan A: RAG (Retrieval-Augmented Qualification)
+### Two-stage retrieval pipeline
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Cropped        │     │  Stage 1:       │     │  Stage 2:       │
+│  anomaly        │ ──▶ │  Embedding      │ ──▶ │  Reranker       │ ──▶ Final results
+│  image          │     │  retrieval      │     │  (image-to-     │
+│                 │     │  (top-k, fast)  │     │  image)         │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+### Stage 1: Embedding retrieval (RAG)
 
 Embed each cropped anomaly and search against a vector database of known anomaly examples.
 
@@ -119,7 +138,9 @@ Embed each cropped anomaly and search against a vector database of known anomaly
 * Extensible: add new anomaly types without retraining
 * Aligns with regulatory "retrieval, not reasoning" framing
 
-**Embedding options (to evaluate)**
+**Embedding model**
+
+Use a single medical CLIP-style model. Candidates to evaluate:
 
 | Model | Notes |
 |-------|-------|
@@ -128,14 +149,124 @@ Embed each cropped anomaly and search against a vector database of known anomaly
 | MedCLIP / PubMedCLIP | Medical CLIP variants |
 | RadImageNet-pretrained | Domain-specific pretraining |
 
+**Nice to have:** Multiple embedding models in parallel (capturing different aspects: texture, shape, semantic meaning) with a synthetic score combining results. Only pursue if single-model evaluation reveals clear blind spots.
+
 **Vector database**
-* Corpus: Embeddings of annotated anomaly examples (curated dataset)
+* Corpus: Embeddings of annotated anomaly examples (internal curated dataset, in progress)
 * Metadata per entry: anomaly label, source image ID, anatomical location
-* Retrieval: top-k nearest neighbors with similarity scores
+* Retrieval: top-k nearest neighbors (e.g., k=50) with similarity scores
 
-**Open question:** Should multiple embedding models be used in parallel (multiple vector spaces) with a synthetic score combining their results?
+### Stage 2: Visual reranking
 
-### Plan B: Classification
+After embedding retrieval, a reranker compares the query crop directly with retrieved example images to refine the ordering.
+
+**Why rerank:**
+* Embeddings capture high-level similarity; reranking verifies fine-grained visual match
+* Catches cases where embeddings are similar but actual appearance differs
+* Improves precision at the top of the results
+
+### Image-to-image comparison
+
+The reranker compares the query crop visually with each retrieved example image. This is the core reranking approach because the goal is to verify visual similarity.
+
+**Summary:**
+
+| Question | Answer |
+|----------|--------|
+| Can an existing model be used? | Yes. Use the same BiomedCLIP model from Stage 1 — essentially free since it's already loaded. |
+| Does it need fine-tuning? | No for baseline. For better precision, a Siamese network can be trained. |
+| Does a new model need to be created? | No. Reuse BiomedCLIP. Siamese network is optional enhancement. |
+| Dataset required | None for zero-shot. Siamese needs pairs of crops labeled "same type" or "different type." |
+
+**Default approach: Zero-shot CLIP reranking**
+
+Since BiomedCLIP is already used for Stage 1 embeddings, reranking is essentially free:
+* Compute embeddings for query crop and each retrieved example
+* Compare with cosine similarity
+* Reorder results by similarity score
+* No additional model, no training data needed
+
+**If needed: Fine-tuned Siamese network**
+
+If zero-shot reranking isn't precise enough, train a Siamese network:
+* Uses pretrained backbone (ResNet, ViT) + learned comparison head
+* Dataset: pairs of anomaly crops labeled "same type" or "different type"
+* Construct from internal dataset: same-label = positive pair, different-label = negative pair
+* Include hard negatives (visually similar but different diagnosis)
+
+**Model options for Siamese (if needed)**
+
+| Model | Notes |
+|-------|-------|
+| Fine-tuned Siamese network | Train on internal dataset to learn "same anomaly type" vs "different." Most controllable. |
+| DINOv2 + comparison head | Strong self-supervised features, good at fine-grained visual similarity |
+| Learned metric networks | ProtoNet, Matching Networks — designed for similarity learning |
+
+### Nice to have: Image-to-label comparison
+
+As an additional confidence signal, compare the query crop against text labels: "does this crop look like a typical [suggested label]?"
+
+**Summary:**
+
+| Question | Answer |
+|----------|--------|
+| Can an existing model be used? | Yes, directly. This is exactly what CLIP-style models do. BiomedCLIP or CheXzero work out of the box. |
+| Does it need fine-tuning? | For baseline: No. For better alignment with your label vocabulary: light fine-tuning helps. |
+| Does a new model need to be created? | No. This is native CLIP functionality. |
+| Dataset required | Zero-shot: Just the label vocabulary. Fine-tuning: anomaly crops paired with text labels. |
+
+**How CLIP image-to-text similarity works:**
+
+CLIP is trained to understand images and text in the **same embedding space**. Both get converted to vectors that can be compared directly.
+
+```
+┌─────────────────┐                              ┌─────────────────┐
+│  Cropped        │                              │  Text:          │
+│  anomaly image  │                              │  "nodule"       │
+└────────┬────────┘                              └────────┬────────┘
+         │                                                │
+         ▼                                                ▼
+┌─────────────────┐                              ┌─────────────────┐
+│  CLIP Image     │                              │  CLIP Text      │
+│  Encoder        │                              │  Encoder        │
+└────────┬────────┘                              └────────┬────────┘
+         │                                                │
+         ▼                                                ▼
+   [0.1, 0.3, -0.2, ...]                          [0.15, 0.28, -0.18, ...]
+   (image embedding)                              (text embedding)
+         │                                                │
+         └──────────────────┬─────────────────────────────┘
+                            │
+                            ▼
+                   Cosine similarity = 0.85
+                   (high = image matches text)
+```
+
+Compare one image against multiple labels to find the best match:
+
+```
+similarity(crop, "nodule")        → 0.85  ← highest = likely a nodule
+similarity(crop, "consolidation") → 0.30
+similarity(crop, "fracture")      → 0.10
+```
+
+**Why this is useful:**
+* No classifier training needed
+* Add new labels by just adding new text strings
+* "Zero-shot" — works without training examples of that specific label
+
+BiomedCLIP and CheXzero understand medical terms like "nodule," "consolidation," "cardiomegaly."
+
+**Implementation options:**
+
+| Approach | New model? | Training data? | Notes |
+|----------|------------|----------------|-------|
+| Zero-shot CLIP | No | No | Use pretrained BiomedCLIP/CheXzero directly. Just need label vocabulary. |
+| Fine-tuned CLIP | No | Light | Fine-tune on your label vocabulary for better alignment. |
+
+**Why nice to have:** This is low-effort if already using CLIP for embeddings, but adds complexity to the pipeline. Validate core RAG + reranking first.
+
+### Fallback: Classification (Plan B)
 
 If embeddings do not produce good clustering of similar anomalies, fall back to a trained classifier.
 
@@ -148,6 +279,13 @@ If embeddings do not produce good clustering of similar anomalies, fall back to 
 * Requires retraining to add new classes
 * Less interpretable
 
+**Training datasets for classification fallback:**
+
+| Dataset | Size | Notes |
+|---------|------|-------|
+| ChestX-ray14 (NIH) | 112k images | 14 disease labels |
+| CheXpert (Stanford) | 224k images | Uncertainty labels, multi-label |
+
 ### Multi-anomaly handling
 
 If Step 1 detects multiple anomalies (e.g., 3 bounding boxes), each is processed through Step 2 **independently**. All results are passed together to Step 3.
@@ -158,45 +296,76 @@ If Step 1 detects multiple anomalies (e.g., 3 bounding boxes), each is processed
 
 **Goal:** Generate a draft radiology report summarizing all findings (or lack thereof).
 
+### Design principle: Prevent late detection
+
+The VLM receives **only cropped anomaly images**, not the full X-ray. This prevents the model from "discovering" new findings not detected in Step 1. The report is strictly based on what the detection pipeline found.
+
 ### Input / Output
 
 | | |
 |---|---|
-| **Input** | Original X-ray, bounding boxes, qualification results for each anomaly |
+| **Input** | Cropped anomaly images, qualification results from Step 2, location metadata |
 | **Output** | Structured draft report |
 
-### Approach
+### Two-stage approach
 
-The LLM/VLM receives:
-1. The original X-ray image (or a summary representation)
-2. Detected anomalies with locations and suggested labels
-3. Qualification context (similar cases, confidence levels)
+**Stage A: VLM describes each anomaly**
 
-It produces a draft report following a constrained schema (e.g., Findings, Impressions sections).
+For each detected anomaly, a VLM receives:
+1. The cropped anomaly image
+2. Similar cases from Step 2 (for context)
+3. Suggested labels and confidence scores
+4. Location metadata (e.g., "right lower lobe")
 
-**Key constraints:**
-* LLM must not introduce findings not present in Step 1/2 outputs
-* Output follows a strict template/schema
-* All findings are traceable to specific bounding boxes
+It outputs a description of that specific finding.
+
+**Stage B: LLM synthesizes report**
+
+An LLM receives all individual finding descriptions and synthesizes them into a coherent radiology report following a structured schema (e.g., Findings, Impressions sections).
+
+**Why two-stage:**
+* Stage A keeps vision isolated to individual findings
+* Stage B is text-to-text, easier to control and audit
+* Clear separation of responsibilities
+
+### Nice to have: Redacted X-ray input
+
+Instead of crops only, provide the full X-ray with:
+* Bounding boxes drawn on detected anomalies
+* Areas outside bounding boxes redacted/grayed out
+
+This gives spatial context while still preventing the VLM from seeing undetected regions.
 
 ### Model options
 
-**Medical VLMs**
-* CheXagent – trained on chest X-ray reports
-* RadFM – radiology foundation model
-* LLaVA-Med – medical fine-tuned LLaVA
+**Stage A (VLM for crop description)**
 
-**General VLMs (with fine-tuning)**
-* GPT-4o / Claude – strong general reasoning
-* LLaVA 1.5/1.6, Qwen-VL, InternVL – open-source options
+| Model | Notes |
+|-------|-------|
+| GPT-4o / Claude | Strong general VLMs with medical prompting |
+| CheXagent | Trained on chest X-ray reports (may need adaptation for crops) |
+| LLaVA-Med | Medical fine-tuned, open-source |
+| RadFM | Radiology foundation model |
+
+Note: Most medical VLMs are trained on full image → full report. For crop → description, general VLMs with strong prompting may perform comparably.
+
+**Stage B (LLM for synthesis)**
+
+* GPT-4o / Claude — strong at structured synthesis
+* Open-source: Llama 3, Mistral with medical fine-tuning
 
 **Fine-tuning strategy**
 * LoRA / QLoRA for efficient adaptation
-* Training data: MIMIC-CXR (images + reports)
+
+**Training dataset for Step 3:**
+
+| Dataset | Size | Notes |
+|---------|------|-------|
+| MIMIC-CXR | 377k images | Includes free-text reports — ideal for report generation training |
 
 ### Normal case
 
-If no anomalies were detected in Step 1, Step 3 generates a report indicating a normal scan (e.g., "No acute cardiopulmonary abnormality identified").
+If no anomalies were detected in Step 1, skip Stage A. Stage B generates a report indicating a normal scan (e.g., "No acute cardiopulmonary abnormality identified").
 
 ---
 
@@ -218,41 +387,9 @@ All clinician modifications are logged for model improvement and audit.
 
 ---
 
-## Datasets
-
-### Public datasets
-
-| Dataset | Size | Notes |
-|---------|------|-------|
-| ChestX-ray14 (NIH) | 112k images | 14 disease labels |
-| CheXpert (Stanford) | 224k images | Uncertainty labels |
-| MIMIC-CXR | 377k images | Includes free-text reports (ideal for Step 3) |
-| RSNA Pneumonia | 30k images | Bounding box annotations (ideal for Step 1) |
-| VinDr-CXR | 18k images | Detailed local annotations |
-
-### Internal dataset (in progress)
-
-Curated anomaly examples for the RAG corpus (Step 2).
-
----
-
-## Pre-training & Tooling
-
-* **ImageNet pre-training** transfers well to X-rays
-* **Medical-specific pre-training** (RadImageNet, CheXpert) improves performance
-
-### Libraries
-
-* MONAI – medical imaging toolkit
-* torchxrayvision – pretrained X-ray models
-* Hugging Face – model hub and training utilities
-
----
-
 ## Open Questions
 
-1. Does the current dataset include **bounding box annotations** for Step 1 training?
-2. Which **embedding model(s)** produce the best clustering for anomaly crops? (key experiment for RAG viability)
-3. Should multiple embedding models and vector spaces be used with a **synthetic scoring** approach?
-4. What **confidence thresholds** should trigger "low confidence" warnings to clinicians?
-5. What is the **report schema** for Step 3 output?
+1. Which **embedding model** (BiomedCLIP, CheXzero, etc.) produces the best clustering for anomaly crops? (key experiment for RAG viability)
+2. What **confidence thresholds** should trigger "low confidence" warnings to clinicians?
+3. What is the **report schema** for Step 3 output?
+4. Is zero-shot CLIP reranking sufficient, or is a **Siamese network** needed for better precision?
