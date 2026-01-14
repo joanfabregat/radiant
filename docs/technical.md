@@ -4,126 +4,217 @@
 
 ---
 
-## Proposed Architecture
+## Pipeline Overview
 
-This architecture is designed to **maximize patient safety, modularity, and regulatory alignment**, by clearly separating detection, contextualization, and report drafting responsibilities.
+The architecture separates detection, qualification, and report generation into three distinct steps for **observability, traceability, and regulatory alignment**.
 
-### High-level pipeline (3 steps, 2 alternatives)
+### High-level pipeline
 
-1. **Segmentation (boundary detection)**
-2. **Classification or RAG**
-3. **LLM / VLM for report generation**
-
-#### Why RAG instead of pure classification
-
-* Can detect:
-    * When **no match exists**
-    * When **multiple options have similar confidence**
-* Safer and more informative in clinical workflows
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              INPUT: X-ray image                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  STEP 1: Anomaly Detection                                                  │
+│  ─────────────────────────                                                  │
+│  Input:  Full X-ray image                                                   │
+│  Output: List of bounding boxes around detected anomalies                   │
+│          (empty list if no anomalies found)                                 │
+│  Model:  Object detection (e.g., YOLOv8, Mask R-CNN, DETR)                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                          ┌────────────┴────────────┐
+                          │                         │
+                    No anomalies              Anomalies found
+                          │                         │
+                          ▼                         ▼
+              ┌───────────────────┐    ┌──────────────────────────────────────┐
+              │ Skip to Step 3    │    │  STEP 2: Anomaly Qualification       │
+              │ (normal report)   │    │  ───────────────────────────         │
+              └───────────────────┘    │  Input:  Cropped anomaly regions     │
+                          │            │  Output: For each anomaly:           │
+                          │            │          - Top-k similar cases       │
+                          │            │          - Similarity scores         │
+                          │            │          - Suggested labels          │
+                          │            │  Method: RAG (Plan A) or             │
+                          │            │          Classification (Plan B)     │
+                          │            └──────────────────────────────────────┘
+                          │                         │
+                          └────────────┬────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  STEP 3: Report Generation                                                  │
+│  ─────────────────────────                                                  │
+│  Input:  - Original X-ray                                                   │
+│          - Bounding boxes from Step 1                                       │
+│          - Qualification results from Step 2 (if any)                       │
+│  Output: Draft report (structured text)                                     │
+│  Model:  LLM or VLM with constrained output schema                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  CLINICIAN REVIEW                                                           │
+│  ─────────────────                                                          │
+│  - View detected anomalies with bounding boxes                              │
+│  - Review qualification results (similar cases)                             │
+│  - Edit draft report: confirm, remove, or add findings                      │
+│  - Added findings feed back into training data                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Step 1 – Segmentation (Boundary Detection)
+## Step 1 – Anomaly Detection
+
+**Goal:** Locate abnormal regions in the X-ray. Output bounding boxes around each detected anomaly.
+
+### Input / Output
+
+| | |
+|---|---|
+| **Input** | Full X-ray image (DICOM or PNG) |
+| **Output** | List of bounding boxes `[(x, y, w, h, confidence), ...]` — empty if no anomalies |
 
 ### Recommended architectures
 
-* **U-Net / U-Net++** – gold standard in medical imaging
-* **Mask R-CNN** – instance segmentation (multiple findings)
-* **DeepLabV3+** – strong semantic segmentation
-* **TransUNet / Swin-UNETR** – transformer-based, long-range context
+**Object detection (preferred)**
 
-### Combined segmentation + classification models
+* **YOLOv8** – fast, accurate, good for real-time
+* **DETR / RT-DETR** – transformer-based, no anchor tuning
+* **Faster R-CNN** – well-established, good accuracy
 
-* Mask R-CNN
-* YOLACT / YOLOv8-seg
-* Detectron2-based architectures
+**Instance segmentation (if pixel-level masks needed)**
 
----
+* **Mask R-CNN** – instance segmentation with bounding boxes
+* **YOLOv8-seg** – fast segmentation variant
 
-## Step 2 – Classification or RAG
+### Normal case handling
 
-### Classification models
-
-* ResNet-50 / ResNet-101
-* EfficientNet
-* DenseNet
-* Vision Transformers (ViT)
-* Swin Transformer
-
-### RAG: Vectorization options
-
-**General vision encoders**
-
-* ResNet / EfficientNet
-* ViT
-
-**Vision–language (CLIP-based)**
-
-* OpenAI CLIP
-* BiomedCLIP
-* MedCLIP / PubMedCLIP
-* MedCLIP, BioCLIP, CheXzero, GLoRIA
-
-**Medical-specific encoders**
-
-* CheXpert / CheXNet
-* RadImageNet-pretrained models
-* MoCo-CXR / SimCLR-CXR
-
-**Custom approaches**
-
-* Siamese networks / Triplet loss
+If Step 1 detects **no anomalies**, the pipeline skips Step 2 and proceeds directly to Step 3 with an empty finding list. Step 3 generates a report indicating no abnormalities were detected.
 
 ---
 
-## Empirical Fit of CLIP-style Models on X-rays
+## Step 2 – Anomaly Qualification
 
-CLIP-like models perform well on X-rays due to their 2D structure and paired reports:
+**Goal:** For each detected anomaly, determine what it is by comparing to known examples.
 
-* Image–report matching
-* Zero-shot / few-shot classification
-* Triage (normal vs abnormal, risk prioritization)
-* Text-guided search
+### Input / Output
 
-These models often match or outperform supervised CNN baselines on classification-style tasks.
+| | |
+|---|---|
+| **Input** | Cropped image region for each bounding box from Step 1 |
+| **Output** | For each anomaly: top-k similar cases, similarity scores, suggested label(s) |
+
+### Plan A: RAG (Retrieval-Augmented Qualification)
+
+Embed each cropped anomaly and search against a vector database of known anomaly examples.
+
+**Why RAG is preferred:**
+* Can signal "no confident match" (important for safety)
+* Interpretable: show clinician similar cases
+* Extensible: add new anomaly types without retraining
+* Aligns with regulatory "retrieval, not reasoning" framing
+
+**Embedding options (to evaluate)**
+
+| Model | Notes |
+|-------|-------|
+| BiomedCLIP | Medical vision-language model, good baseline |
+| CheXzero | Trained on chest X-rays specifically |
+| MedCLIP / PubMedCLIP | Medical CLIP variants |
+| RadImageNet-pretrained | Domain-specific pretraining |
+
+**Vector database**
+* Corpus: Embeddings of annotated anomaly examples (curated dataset)
+* Metadata per entry: anomaly label, source image ID, anatomical location
+* Retrieval: top-k nearest neighbors with similarity scores
+
+**Open question:** Should multiple embedding models be used in parallel (multiple vector spaces) with a synthetic score combining their results?
+
+### Plan B: Classification
+
+If embeddings do not produce good clustering of similar anomalies, fall back to a trained classifier.
+
+* Input: Cropped anomaly region
+* Output: Class label + confidence score
+* Models: ResNet, EfficientNet, ViT, Swin Transformer
+
+**Downsides vs RAG:**
+* Cannot express "I don't know"
+* Requires retraining to add new classes
+* Less interpretable
+
+### Multi-anomaly handling
+
+If Step 1 detects multiple anomalies (e.g., 3 bounding boxes), each is processed through Step 2 **independently**. All results are passed together to Step 3.
 
 ---
 
-## Step 3 – Report Generation (VLM / LLM)
+## Step 3 – Report Generation
+
+**Goal:** Generate a draft radiology report summarizing all findings (or lack thereof).
+
+### Input / Output
+
+| | |
+|---|---|
+| **Input** | Original X-ray, bounding boxes, qualification results for each anomaly |
+| **Output** | Structured draft report |
+
+### Approach
+
+The LLM/VLM receives:
+1. The original X-ray image (or a summary representation)
+2. Detected anomalies with locations and suggested labels
+3. Qualification context (similar cases, confidence levels)
+
+It produces a draft report following a constrained schema (e.g., Findings, Impressions sections).
+
+**Key constraints:**
+* LLM must not introduce findings not present in Step 1/2 outputs
+* Output follows a strict template/schema
+* All findings are traceable to specific bounding boxes
+
+### Model options
 
 **Medical VLMs**
+* CheXagent – trained on chest X-ray reports
+* RadFM – radiology foundation model
+* LLaVA-Med – medical fine-tuned LLaVA
 
-* LLaVA-Med
-* Med-Flamingo
-* CheXagent
-* RadFM
-
-**General VLMs**
-
-* GPT-4V
-* LLaVA 1.5 / 1.6
-* Qwen-VL
-* InternVL
+**General VLMs (with fine-tuning)**
+* GPT-4o / Claude – strong general reasoning
+* LLaVA 1.5/1.6, Qwen-VL, InternVL – open-source options
 
 **Fine-tuning strategy**
+* LoRA / QLoRA for efficient adaptation
+* Training data: MIMIC-CXR (images + reports)
 
-* LoRA / QLoRA
-* Inputs: X-rays + segmentation masks
-* Outputs: Draft reports (optionally structured)
+### Normal case
+
+If no anomalies were detected in Step 1, Step 3 generates a report indicating a normal scan (e.g., "No acute cardiopulmonary abnormality identified").
 
 ---
 
-## Pre-training & Tooling
+## Human-in-the-Loop Integration
 
-* **ImageNet pre-training transfers well**, even for grayscale X-rays
-* Medical-specific pre-training improves performance further
+The clinician receives the complete pipeline output:
 
-### Platforms & libraries
+1. **Original X-ray** with bounding boxes overlaid
+2. **Per-anomaly detail view**: cropped region, similar cases from RAG, suggested label
+3. **Draft report** ready for review
 
-* MedMNIST
-* torchxrayvision
-* MONAI
-* Hugging Face
+**Clinician actions:**
+* **Confirm** findings as-is
+* **Remove** false positive detections
+* **Add** missed findings (these are logged and fed back to improve models)
+* **Edit** report text
+
+All clinician modifications are logged for model improvement and audit.
 
 ---
 
@@ -131,16 +222,37 @@ These models often match or outperform supervised CNN baselines on classificatio
 
 ### Public datasets
 
-* **ChestX-ray14 (NIH)** – 100k+ labeled images
-* **CheXpert (Stanford)** – 224k radiographs
-* **MIMIC-CXR** – 377k images + reports (ideal for step 3)
-* **RSNA Pneumonia Detection** – includes bounding boxes
-* **VinDr-CXR** – detailed annotations
+| Dataset | Size | Notes |
+|---------|------|-------|
+| ChestX-ray14 (NIH) | 112k images | 14 disease labels |
+| CheXpert (Stanford) | 224k images | Uncertainty labels |
+| MIMIC-CXR | 377k images | Includes free-text reports (ideal for Step 3) |
+| RSNA Pneumonia | 30k images | Bounding box annotations (ideal for Step 1) |
+| VinDr-CXR | 18k images | Detailed local annotations |
+
+### Internal dataset (in progress)
+
+Curated anomaly examples for the RAG corpus (Step 2).
+
+---
+
+## Pre-training & Tooling
+
+* **ImageNet pre-training** transfers well to X-rays
+* **Medical-specific pre-training** (RadImageNet, CheXpert) improves performance
+
+### Libraries
+
+* MONAI – medical imaging toolkit
+* torchxrayvision – pretrained X-ray models
+* Hugging Face – model hub and training utilities
 
 ---
 
 ## Open Questions
 
-1. Does the current dataset include **segmentation annotations**?
-2. Which **embedding model(s)** should be used for RAG?
-3. Should multiple embedding models and **multiple vector spaces** be used in parallel to capture different characteristics?
+1. Does the current dataset include **bounding box annotations** for Step 1 training?
+2. Which **embedding model(s)** produce the best clustering for anomaly crops? (key experiment for RAG viability)
+3. Should multiple embedding models and vector spaces be used with a **synthetic scoring** approach?
+4. What **confidence thresholds** should trigger "low confidence" warnings to clinicians?
+5. What is the **report schema** for Step 3 output?
