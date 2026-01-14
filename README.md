@@ -8,6 +8,6 @@ Project Radiant is a human-in-the-loop platform focused on workflow optimization
 
 ## Documentation
 
-- [Project Overview](./docs/index.md) — Executive summary, vision, and core concepts
+- [Project Overview](./docs/README.md) — Executive summary, vision, and core concepts
 - [Technical Architecture](./docs/technical.md) — Pipeline design, models, and datasets
 - [Business & Strategy](./docs/business.md) — Market entry, regulatory, and fundraising

@@ -67,7 +67,7 @@ Radiology serves as the initial proof point; dermatology and future specialties 
 
 ---
 
-## Documentation
+## Related Documentation
 
 - [Technical Architecture](./technical.md) — Architecture, models, datasets, and implementation details
 - [Business & Strategy](./business.md) — Market entry, regulatory strategy, fundraising, and operating model
